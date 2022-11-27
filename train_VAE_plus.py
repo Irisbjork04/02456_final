@@ -73,7 +73,7 @@ def samples_real(name, test_loader):
         ax.imshow(plottable_image)
         ax.axis('off')
 
-    plt.savefig(name + '_real_images.pdf', bbox_inches='tight')
+    plt.savefig(name + '_real_images.png', bbox_inches='tight')
     plt.close()
     
 
@@ -97,7 +97,7 @@ def samples_generated(name, data_loader, extra_name=''):
         ax.imshow(plottable_image)
         ax.axis('off')
 
-    plt.savefig(name + '_generated_images' + extra_name + '.pdf', bbox_inches='tight')
+    plt.savefig(name + '_generated_images' + extra_name + '.png', bbox_inches='tight')
     plt.close()
     
 
@@ -105,7 +105,7 @@ def plot_curve(name, nll_val, x_label="epochs", y_label="nll"):
     plt.plot(np.arange(len(nll_val)), nll_val, linewidth='3')
     plt.xlabel(x_label)
     plt.ylabel(y_label)
-    plt.savefig(name + '.pdf', bbox_inches='tight')
+    plt.savefig(name + '.png', bbox_inches='tight')
     plt.close()
 
 
@@ -210,8 +210,10 @@ batch_size = 102
 images_folder = '/zhome/70/5/14854/nobackup/deeplearningf22/bbbc021/singlecell/singh_cp_pipeline_singlecell_images/'
 train_transforms = transforms.Compose(
     [transforms.ToTensor(),
-     transforms.Lambda(lambda x: torch.flatten(x)),
-     transforms.Lambda(lambda x: x/x.max())]
+     transforms.Lambda(lambda x: x/x.max()),
+     #transforms.Lambda(lambda x: x/torch.amax(x, dim=(0, 1))),
+     #transforms.Lambda(lambda x: torch.flatten(x))
+    ]
 )
 
 train_set = SingleCellDataset(images_folder=images_folder, 
@@ -220,7 +222,7 @@ train_set = SingleCellDataset(images_folder=images_folder,
                               class_map=classes)
 
 # Define the size of the train, validation and test datasets
-data_prct = 0.1
+data_prct = 1
 train_prct = 0.95
 
 data_amount = int(len(metadata_subsampled) * data_prct)
@@ -232,11 +234,6 @@ indicies = torch.randperm(len(metadata_subsampled))
 train_indices = indicies[:train_size]
 val_indicies = indicies[train_size:train_size+val_size]
 test_indicies = indicies[train_size+val_size:train_size+val_size+test_size]
-
-# Checking there are not overlapping incdicies
-#print(sum(np.isin(train_indices.numpy() , [val_indicies.numpy(), test_indicies.numpy()])))
-#print(sum(np.isin(val_indicies.numpy() , [train_indices.numpy(), test_indicies.numpy()])))
-#print(sum(np.isin(test_indicies.numpy() , [train_indices.numpy(), val_indicies.numpy()])))
 
 training_set = torch.utils.data.Subset(train_set, train_indices.tolist())
 val_set = torch.utils.data.Subset(train_set, val_indicies.tolist())
@@ -255,7 +252,7 @@ images, labels = next(iter(training_loader))
 
 # Variational autoencoder class
 
-nbUnits = 32
+nbUnits = 64
 latent_features = 256
 
 class PrintSize(nn.Module):
@@ -295,8 +292,12 @@ class VariationalAutoencoder(nn.Module):
         # Inference Network
         # Encode the observation `x` into the parameters of the posterior distribution
         # `q_\phi(z|x) = N(z | \mu(x), \sigma(x)), \mu(x),\log\sigma(x) = h_\phi(x)`
-        self.encoder = nn.Sequential(
-            nn.Linear(in_features=self.observation_features, out_features=256),
+        """self.encoder = nn.Sequential(
+            nn.Linear(in_features=self.observation_features, out_features=512),
+            nn.ReLU(),
+            nn.Linear(in_features=512, out_features=512),
+            nn.ReLU(),
+            nn.Linear(in_features=512, out_features=256),
             nn.ReLU(),
             nn.Linear(in_features=256, out_features=128),
             nn.ReLU(),
@@ -313,7 +314,110 @@ class VariationalAutoencoder(nn.Module):
             nn.ReLU(),
             nn.Linear(in_features=128, out_features=256),
             nn.ReLU(),
-            nn.Linear(in_features=256, out_features=2*self.observation_features)
+            nn.Linear(in_features=256, out_features=512),
+            nn.ReLU(),
+            nn.Linear(in_features=512, out_features=512),
+            nn.ReLU(),
+            nn.Linear(in_features=512, out_features=2*self.observation_features)
+        ) """
+        self.encoder = nn.Sequential(
+          # Layer 0 [hw_in=68, hw_out=64>32]: INPUT LAYER
+            # W2=(W1−K+2P)/S]+1=[(68 - 5 + 2*0)/1]+1 = 64
+            nn.Conv2d(in_channels=self.input_shape[0], 
+                      out_channels=nbUnits, 
+                      kernel_size=5, 
+                      stride=1), 
+            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(64 - 2)/2] + 1 = 32
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 1 [hw_in=32, hw_out=28>14]
+            # W2=(W1−K+2P)/S]+1=[(32 - 5 + 2*0)/1]+1 = 28
+            nn.Conv2d(in_channels=nbUnits, 
+                      out_channels=nbUnits, 
+                      kernel_size=(5,5), 
+                      stride=(1,1)), 
+            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(28 - 2)/2] + 1 = 14
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 2 [hw_in=14, hw_out=10>5]
+            # W2=(W1−K+2P)/S]+1=[(14 - 5 + 2*0)/1]+1 = 10
+            nn.Conv2d(in_channels=nbUnits, 
+                      out_channels=nbUnits, 
+                      kernel_size=(5,5), 
+                      stride=(1,1)), 
+            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(10 - 2)/2] + 1 = 5
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 3 [hw_in=5, hw_out=1]: EMBEDDING
+            # W2=(W1−K+2P)/S]+1=[(5 - 5 + 2*0)/1]+1 = 1
+            nn.Conv2d(in_channels=nbUnits, 
+                      out_channels=nbUnits, 
+                      kernel_size=(5,5), 
+                      stride=(1,1)), 
+            PrintSize(),
+            Flatten(),
+            nn.Linear(in_features=nbUnits, out_features=2*latent_features),
+            PrintSize(),
+        )
+        
+        
+        # Generative Model
+        # Decode the latent sample `z` into the parameters of the observation model
+        # `p_\theta(x | z) = \prod_i B(x_i | g_\theta(x))`
+        self.decoder = nn.Sequential(
+
+            # Layer 3+1 [hw_in=1, hw_out=5<10]
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (1-1)*1-2*0+1*(4-1)+0+1 = 4
+            UnFlatten(),
+            nn.ConvTranspose2d(in_channels=latent_features, 
+                               out_channels=nbUnits, 
+                               kernel_size=4, 
+                               stride=1,
+                               padding=0),
+            #nn.UpsamplingNearest2d(size=(10,10)),
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 3+2 [hw_in=10<10+8, hw_out=14<28]
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (4-1)*2-2*1+1*(4-1)+0+1 = 8
+            nn.ConvTranspose2d(in_channels=nbUnits, 
+                               out_channels=nbUnits, 
+                               kernel_size=4, 
+                               stride=2,
+                               padding=1),
+            #nn.UpsamplingNearest2d(size=(28,28)),
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 3+3 [hw_in=28<28+8, hw_out=32<64]
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (8-1)*2-2*1+1*(4-1)+0+1 = 16
+            nn.ConvTranspose2d(in_channels=nbUnits, 
+                               out_channels=nbUnits, 
+                               kernel_size=4, 
+                               stride=2,
+                               padding=1),
+            #nn.UpsamplingNearest2d(size=(64,64)),
+            nn.LeakyReLU(),
+            PrintSize(),
+
+             # (H−1)×S−2×P+D×(K−1)+OP+1 = (16-1)*2-2*1+1*(4-1)+0+1 = 32
+            nn.ConvTranspose2d(in_channels=nbUnits, 
+                               out_channels=nbUnits, 
+                               kernel_size=4, 
+                               stride=2,
+                               padding=1),
+            #nn.UpsamplingNearest2d(size=(64,64)),
+            nn.LeakyReLU(),
+            PrintSize(),
+            
+            # Layer 3+4 [hw_in=64, hw_out=68]: FINAL ACTIVATION
+            nn.ConvTranspose2d(in_channels=nbUnits, 
+                      out_channels=2*self.input_shape[0], 
+                      kernel_size=5, stride=1, padding=0),
+            PrintSize()
         )
         
         # define the parameters of the prior, chosen as p(z) = N(0, I)
@@ -500,37 +604,33 @@ class Discriminator(nn.Module):
         x_img = self.conv_first(x_img) # W2=(W1−K+2P)/S]+1=[(68 - 5 + 2*0)/1]+1 = 64
         x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(64 - 2)/2] + 1 = 32
         x_img = self.activation(x_img)
-        x_img = self.batchnorm1_2d(x_img)
+        #x_img = self.batchnorm1_2d(x_img)
         x_img_1 = x_img
         
         # Layer 1 [hw_in=32, hw_out=28>14]
         x_img = self.conv_mid(x_img) # W2=(W1−K+2P)/S]+1=[(32 - 5 + 2*0)/1]+1 = 28
         x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(28 - 2)/2] + 1 = 14
         x_img = self.activation(x_img)
-        x_img = self.batchnorm1_2d(x_img)
+        #x_img = self.batchnorm1_2d(x_img)
         x_img_2 = x_img
 
         # Layer 2 [hw_in=14, hw_out=10>5]
         x_img = self.conv_mid(x_img) # W2=(W1−K+2P)/S]+1=[(14 - 5 + 2*0)/1]+1 = 10
         x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(10 - 2)/2] + 1 = 5
         x_img = self.activation(x_img)
-        x_img = self.batchnorm1_2d(x_img)
+        #x_img = self.batchnorm1_2d(x_img)
         x_img_3 = x_img
 
         # Layer 3 [hw_in=5, hw_out=1]: 
         x_img = self.conv_last(x_img) # W2=(W1−K+2P)/S]+1=[(5 - 5 + 2*0)/1]+1 = 1
         x_img = self.activation(x_img)
-        x_img = self.batchnorm2_2d(x_img)
-        x_img_4 = x_img
         
         # Layer 4 [hw_in=1, hw_out=1]:
         x_img = self.conv_out(x_img) # W2=(W1−K+2P)/S]+1=[(1 - 1 + 2*0)/1]+1 = 1
-        x_img = self.batchnorm3_2d(x_img)
-        x_img_5 = x_img
 
         x_img = self.sigmoid(x_img)
 
-        intermediate_rep = [x_img_1, x_img_2, x_img_3, x_img_4, x_img_5]
+        intermediate_rep = [x_img_1, x_img_2, x_img_3]
         output = x_img
         
         return output, intermediate_rep
@@ -580,31 +680,42 @@ discrim = Discriminator(input_size,
 #discrim.apply(initialize_weights)
 
 # The Adam optimizer works really well with VAEs.
-vae_optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
-discriminator_optim = torch.optim.SGD(discrim.parameters(), 1e-2, momentum=0.9)
+vae_optimizer = torch.optim.Adam(vae.parameters(), lr=1e-2)
+discriminator_optim = torch.optim.SGD(discrim.parameters(), lr=1e-5)
 
 # define dictionary to store the training curves
 training_data = defaultdict(list)
 validation_data = defaultdict(list)
 
+def schedule_weight(delay):
+    """ Defines a delayed, linear, saturated schedulling function.
+    """
+    step_norm = max(0.0, step - delay)
+    w = step_norm / slope
+    w = max(0.0, min(1.0, w)) #-- Bounded weight
+    return w
+
 epoch = 0
-num_epochs = 5
+num_epochs = 15
 nll_val = []
 best_nll = 1000000.
 patience = 0
-max_patience = 20
+max_patience = 40
 slope  = 2500.0
 discriminator_layers = 5
 loss_repr_func = nn.MSELoss()
 bce_loss = nn.BCELoss()
 representation_loss = []
-discriminator_loss = []
+discriminator_real_loss = []
+discriminator_fake_loss = []
+discriminator_avg_loss = []
+discriminator_sum_loss = []
 total_loss = []
 real_label = 1.0
 fake_label = 0.0
 
 name = 'vae_plus'
-result_dir = 'results_plus/'
+result_dir = 'results_plus_slope_2500_lower_D_lr_without_batchnorm/'
 if not(os.path.exists(result_dir)):
     os.mkdir(result_dir)
 
@@ -622,20 +733,23 @@ while epoch < num_epochs:
     
     epoch += 1
     training_epoch_data = defaultdict(list)
-    batch_discrim_loss = []
+    batch_discrim_avg_loss = []
+    batch_discrim_sum_loss = []
+    batch_discrim_real_loss = []
+    batch_discrim_fake_loss = []
     batch_total_loss = []
     batch_repr_loss = []
     vae.train()
     discrim.train()
-    D_losses = []
-    
+
     # Go through each batch in the training dataset using the loader
     # Note that y is not necessarily known as it is here
     for x, y in training_loader:
 
-        if epoch < 4: 
 
-            ### Step 0. Train discriminator alone for a few epochs.
+            ############################
+            # (Step 0) Prepare data:
+            ###########################
             step += 1
             tmp_batch_size = x.size(0)
             b1, b2 = torch.split(x, split_size_or_sections=tmp_batch_size//2)
@@ -648,16 +762,16 @@ while epoch < num_epochs:
             b1_reshaped = b1.reshape(batch_size_half, 3, 68, 68)
             b2_reshaped = b2.reshape(batch_size_half, 3, 68, 68)
 
+            
             ############################
-            # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+            # (Step 1) Update Discriminator network:
             ###########################
             ## Train with all-real batch
             discriminator_optim.zero_grad()
             
-            # Format batch
-            b2 = b2.to(device)
-            batch_size_half = b2.size(0)
-            label = torch.full((batch_size_half,), real_label, dtype=torch.float, device=device)
+            # Format labels
+            label = torch.full((batch_size_half,), real_label,
+                                dtype=torch.float, device=device)
             
             # Forward pass real batch through D
             b2_reshaped = b2.reshape(batch_size_half, 3, 68, 68)
@@ -666,11 +780,9 @@ while epoch < num_epochs:
             
             # Calculate loss on all-real batch
             errD_real = bce_loss(output_real_b2, label)
-            print(f"errD_real: {errD_real.item()}")
             
             # Calculate gradients for D in backward pass
             errD_real.backward()
-            #D_x = output_real_b2.mean().item()
 
             ## Train with all-fake batch
             ### Pass real images from batch 1 (b1) through VAE
@@ -684,64 +796,40 @@ while epoch < num_epochs:
 
             # Calculate D's loss on the all-fake batch
             errD_fake = bce_loss(output_hat, label)
-            print(f"errD_fake: {errD_fake.item()}")
 
             # Calculate the gradients for this batch, accumulated (summed) with previous gradients
             errD_fake.backward()
-            #D_G_z1 = output_hat.mean().item()
 
             # Compute error of D as sum over the fake and the real batches
             errD = errD_real + errD_fake
             #print((errD_real/(errD_real + errD_fake)).item())
-            print(f"errD: {errD.item()}")
-            D_losses.append(errD.item())
+            #print(f"errD: {errD.item()}")
 
             # Update weights
-            #errD.backward()
             discriminator_optim.step()
+            
+            ############################
+            # (Step 2) Update VAE network:
+            ###########################
 
+            vae_optimizer.zero_grad()
 
-        else:
-            step += 1
-            tmp_batch_size = x.size(0)
-            b1, b2 = torch.split(x, split_size_or_sections=tmp_batch_size//2)
-            batch_size_half = b1.size(0)
+            # Pass real images from batch 1 (b1) through VAE:
+            #loss_elbo, xhat, diagnostics, outputs = vi(vae, b1)
+            #xhat_reshaped = xhat.reshape(batch_size_half, 3, 68, 68).to(device)
             
-            b1 = b1.to(device)
-            b2 = b2.to(device)
-            
-            # Reshape to in order to be used as input to conv layers
-            b1_reshaped = b1.reshape(batch_size_half, 3, 68, 68)
-            b2_reshaped = b2.reshape(batch_size_half, 3, 68, 68)
-            
-            # True data is given label 1, while fake data is given label 0
-            true_label = torch.ones(batch_size_half, 1).to(device)
-            fake_label = torch.zeros(batch_size_half, 1).to(device)
-            
-            ### Step 1. Pass real images from batch 1 (b1) through VAE
-            loss_elbo, xhat, diagnostics, outputs = vi(vae, b1)
-            xhat_reshaped = xhat.reshape(batch_size_half, 3, 68, 68).to(device)
-            
-            ### Step 2. Pass x-hat (reconstructions) through Discriminator
+            # Pass x-hat (reconstructions) through Discriminator
             # without calculating gradients
-            output_hat, inter_repr_fake = discrim(xhat_reshaped.detach())
+            output_hat, inter_repr_fake = discrim(xhat_reshaped)
             
-            ### Step 3. Pass real images from batch 1 (b1) through Discriminator
+            # Pass real images from batch 1 (b1) through Discriminator
             # without calculating gradients
-            output_real_b1, inter_repr_real_b1 = discrim(b1_reshaped.detach())
+            output_real_b1, inter_repr_real_b1 = discrim(b1_reshaped)
             
-            ### Step 4. Calculate the loss between the representations
+            # Calculate the loss between the representations
             # of the real images and the reconstructions 
             loss_repr = 0
             loss_repr_list = []
-
-            def schedule_weight(delay):
-                """ Defines a delayed, linear, saturated schedulling function.
-                """
-                step_norm = max(0.0, step - delay)
-                w = step_norm / slope
-                w = max(0.0, min(1.0, w)) #-- Bounded weight
-                return w
 
             delays = [slope * (k+1) for k in range(discriminator_layers)]
 
@@ -753,101 +841,75 @@ while epoch < num_epochs:
                 loss_repr += loss_weight * loss_batch #-- Schedule-based weighted average
             
             loss_total = loss_elbo + loss_repr
+            print(f"Training loss: {loss_total}")
             
-            ### Step 5. Backpropagate the gradients for the VAE
-            vae_optimizer.zero_grad()
+            # Backpropagate the gradients for the VAE
             loss_total.backward()
             vae_optimizer.step()
-            
-            ### Step 6. Pass reconstrcutions (fake) and b2 real images through the discriminator,
-            # backpropagate the errors and update the weights of the discriminator
-            
-            discriminator_optim.zero_grad()
-
-            # Get the output from the discriminator
-            output_hat, inter_repr_fake = discrim(xhat_reshaped.detach())
-            output_real_b2, inter_repr_real_b2 = discrim(b2_reshaped)
-
-            # Calculate the error and backpropagate 
-            # For the real images (b2)
-            output_real_b2 = output_real_b2.view(batch_size_half, 1)
-            #output_real_b2_sigmoid = torch.sigmoid(output_real_b2)
-            error_true = bce_loss(output_real_b2, true_label)
-            error_true.backward()
-
-            # For the reconstructions:
-            output_hat = output_hat.view(batch_size_half, 1)
-            #output_hat_sigmoid = torch.sigmoid(output_hat)
-            error_fake = bce_loss(output_hat, fake_label)
-            error_fake.backward()
-
-            # Update weights
-            discriminator_optim.step()
-            
+                        
             # gather data for the current bach
             for k, v in diagnostics.items():
                 training_epoch_data[k] += [v.mean().item()]
             
-            batch_discrim_loss.append((error_true/(error_true + error_fake)).item())
+            batch_discrim_real_loss.append(errD_real.item())
+            batch_discrim_fake_loss.append(errD_fake.item())
+            batch_discrim_avg_loss.append((errD_real/(errD_real + errD_fake)).item())
+            batch_discrim_sum_loss.append(errD.item())   
             batch_repr_loss.append(loss_repr.item())
-            batch_total_loss.append(loss_total.item())    
-
-            print(f"Discriminator loss: {(error_true/(error_true + error_fake)).item()}")
-            print(f"loss_repr_list: {loss_repr_list}")
-            print(f"loss_elbo: {loss_elbo}")
-            print(f"loss_repr: {loss_repr}")
-            print(f"loss_total: {loss_total}")
-
-    if epoch >= 4:      
-        # gather data for the full epoch
-        for k, v in training_epoch_data.items():
-            training_data[k] += [np.mean(training_epoch_data[k])]
+            batch_total_loss.append(loss_total.item()) 
+    
+    # gather data for the full epoch
+    for k, v in training_epoch_data.items():
+        training_data[k] += [np.mean(training_epoch_data[k])]
+    
+    discriminator_real_loss.append(np.mean(batch_discrim_real_loss))
+    discriminator_fake_loss.append(np.mean(batch_discrim_fake_loss))
+    discriminator_avg_loss.append(np.mean(batch_discrim_avg_loss))
+    discriminator_sum_loss.append(np.mean(batch_discrim_sum_loss))
+    representation_loss.append(np.mean(batch_repr_loss))
+    total_loss.append(np.mean(batch_total_loss))
         
-        discriminator_loss.append(np.mean(batch_discrim_loss))
-        representation_loss.append(np.mean(batch_repr_loss))
-        total_loss.append(np.mean(batch_total_loss))
-            
-        # Evaluate on a single batch, do not propagate gradients
-        with torch.no_grad():
-            vae.eval()
-            
-            # Just load a single batch from the validation loader
-            x, y = next(iter(val_loader))
-            x = x.to(device)
-            
-            # perform a forward pass through the model and compute the ELBO
-            loss_val, xhat, diagnostics, outputs = vi(vae, x)
-            print(f"loss_val: {loss_val}")
-            nll_val.append(loss_val.cpu())  # save for plotting
-            
-            # gather data for the validation step
-            for k, v in diagnostics.items():
-                validation_data[k] += [v.mean().item()]
+    # Evaluate on a single batch, do not propagate gradients
+    with torch.no_grad():
+        vae.eval()
         
-        # Reproduce the figure from the begining of the notebook, plot the training curves and show latent samples
-        make_vae_plots(vae, x, y, outputs, training_data, validation_data)
+        # Just load a single batch from the validation loader
+        x, y = next(iter(val_loader))
+        x = x.to(device)
+        
+        # perform a forward pass through the model and compute the ELBO
+        loss_val, xhat, diagnostics, outputs = vi(vae, x)
+        print(f"loss_val: {loss_val}")
+        nll_val.append(loss_val.cpu())  # save for plotting
+        
+        # gather data for the validation step
+        for k, v in diagnostics.items():
+            validation_data[k] += [v.mean().item()]
+    
+    # Reproduce the figure from the begining of the notebook, plot the training curves and show latent samples
+    # make_vae_plots(vae, x, y, outputs, training_data, validation_data)
 
-        if epoch == 1:
-                print('saved!')
-                torch.save(vae, result_dir + name + '_new.model')
-                best_nll = loss_val
+    if epoch == 1:
+            print('saved!')
+            torch.save(vae, result_dir + name + '.model')
+            best_nll = loss_val
+    else:
+        if loss_val < best_nll:
+            print('saved!')
+            torch.save(vae, result_dir + name + '.model')
+            best_nll = loss_val
+            patience = 0
+
+            samples_generated(result_dir + name, val_loader, extra_name="_epoch_" + str(epoch))
         else:
-            if loss_val < best_nll:
-                print('saved!')
-                torch.save(vae, result_dir + name + '.model')
-                best_nll = loss_val
-                patience = 0
-
-                samples_generated(result_dir + name, val_loader, extra_name="_epoch_" + str(epoch))
-            else:
-                patience = patience + 1
-            
-        if patience > max_patience:
-            print("Max patience reached! Performing early stopping!")
-            break
+            patience = patience + 1
+        
+    if patience > max_patience:
+        print("Max patience reached! Performing early stopping!")
+        break
 
 make_vae_plots(vae, x, y, outputs, training_data, validation_data,
-               save_img="results_plus/vae_out.png", save=True)
+               save_img= result_dir + "vae_out.png", save=True)
 
 # Evaluation
 test_loss = evaluation(name=result_dir + name, test_loader=test_loader)
@@ -858,6 +920,10 @@ f.close()
 samples_real(result_dir + name, test_loader)
 
 plot_curve(result_dir + name + "_nll_val_curve", nll_val)
-plot_curve(result_dir + name + "_discriminator_loss", discriminator_loss, y_label="discriminator_loss")
+plot_curve(result_dir + name + "_discriminator_real_loss", discriminator_real_loss, y_label="discriminator_real_loss")
+plot_curve(result_dir + name + "_discriminator_fake_loss", discriminator_fake_loss, y_label="discriminator_fake_loss")
+plot_curve(result_dir + name + "_discriminator_avg_loss", discriminator_avg_loss, y_label="discriminator_avg_loss")
+plot_curve(result_dir + name + "_discriminator_sum_loss", discriminator_sum_loss, y_label="discriminator_sum_loss")
 plot_curve(result_dir + name + "_representation_loss", representation_loss, y_label="representation_loss")
 plot_curve(result_dir + name + "_total_loss", total_loss, y_label="total_loss")
+
