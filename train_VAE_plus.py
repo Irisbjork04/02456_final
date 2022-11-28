@@ -8,11 +8,13 @@ from collections import defaultdict
 from typing import *
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import numpy as np
 import seaborn as sns
 import pandas as pd
 import math 
 import torch
+import torchvision.utils as vutils
 from torch import nn, Tensor, sigmoid
 from torch.nn.functional import softplus
 from torch.distributions import Distribution, Bernoulli
@@ -26,14 +28,69 @@ sns.set_style("whitegrid")
 
 print(torch.__version__)
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f">> Using device: {device}")
+
 print(torch.cuda.is_available())
 print(torch.cuda.current_device())
 print(torch.cuda.device(0))
 print(torch.cuda.device_count())
 print(torch.cuda.get_device_name(0))
 
-### Evalutation and plotting functions
+# Initialize parameters
+# Number of workers for dataloader
+workers = 1
 
+# Batch size during training
+batch_size = 128
+
+# Spatial size of training images. All images will be resized to this
+#   size using a transformer.
+image_size = 68
+
+# Number of channels in the training images. For color images this is 3
+nc = 3
+
+# Size of z latent vector
+latent_features = 100
+
+# Size of feature maps in VAE encoder and decoder
+ngf = 64
+
+# Size of feature maps in discriminator
+ndf = 64
+
+# Number of training epochs
+num_epochs = 5
+
+# Max patience for early stopping
+max_patience = 40
+
+# Learning rate for optimizers
+lr_VAE = 0.01
+lr_D = 1e-5
+
+# Beta1 hyperparam for Adam optimizers
+beta1 = 0.5
+
+# Beta2 hyperparam for VAE loss
+beta2 = 2.0
+
+# Number of GPUs available. Use 0 for CPU mode.
+ngpu = 1
+
+# The value the DMSO category is downsampled to
+downsample_value = 16000
+
+# Amount of data used for training, validation and testing
+data_prct = 1
+train_prct = 0.95
+
+# Slope for delayed, linear, saturated schedulling of representation loss
+slope  = 2500.0
+
+
+### Evalutation and plotting functions
 def evaluation(test_loader, name=None, model_best=None, epoch=None,
                device='cpu'):
     # EVALUATION
@@ -116,8 +173,6 @@ start_time = time.time()
 metadata = pd.read_csv('/zhome/70/5/14854/nobackup/deeplearningf22/bbbc021/singlecell/metadata.csv')
 #metadata = pd.read_csv('/Users/mikkelrasmussen/mnt/deep_learning_project/data/metadata.csv', engine="pyarrow")
 print("pd.read_csv wiht pyarrow took %s seconds" % (time.time() - start_time))
-
-downsample_value = 16000
 
 # DMSO category
 DMSO_indx = metadata.index[metadata['moa'] == 'DMSO']
@@ -203,8 +258,6 @@ class ReparameterizedDiagonalGaussianWithSigmoid(ReparameterizedDiagonalGaussian
         return sigmoid(z)
 
 
-batch_size = 102
-
 # The loaders perform the actual work
 #images_folder = "/Users/mikkelrasmussen/mnt/deep_learning_project/data/singh_cp_pipeline_singlecell_images"
 images_folder = '/zhome/70/5/14854/nobackup/deeplearningf22/bbbc021/singlecell/singh_cp_pipeline_singlecell_images/'
@@ -222,9 +275,6 @@ train_set = SingleCellDataset(images_folder=images_folder,
                               class_map=classes)
 
 # Define the size of the train, validation and test datasets
-data_prct = 1
-train_prct = 0.95
-
 data_amount = int(len(metadata_subsampled) * data_prct)
 train_size = int(train_prct * data_amount)
 val_size = (data_amount - train_size) // 2
@@ -251,10 +301,6 @@ print(len(test_loader.dataset))
 images, labels = next(iter(training_loader))
 
 # Variational autoencoder class
-
-nbUnits = 64
-latent_features = 256
-
 class PrintSize(nn.Module):
     """Utility module to print current shape of a Tensor in Sequential, only at the first pass."""
     
@@ -282,85 +328,72 @@ class VariationalAutoencoder(nn.Module):
     * a Gaussian posterior `q_\phi(z|x) = N(z | \mu(x), \sigma(x))`
     """
     
-    def __init__(self, input_shape:torch.Size, latent_features:int) -> None:
+    def __init__(self, latent_features:int) -> None:
         super(VariationalAutoencoder, self).__init__()
         
-        self.input_shape = input_shape
         self.latent_features = latent_features
-        self.observation_features = np.prod(input_shape)
         
         # Inference Network
         # Encode the observation `x` into the parameters of the posterior distribution
         # `q_\phi(z|x) = N(z | \mu(x), \sigma(x)), \mu(x),\log\sigma(x) = h_\phi(x)`
-        """self.encoder = nn.Sequential(
-            nn.Linear(in_features=self.observation_features, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=256),
-            nn.ReLU(),
-            nn.Linear(in_features=256, out_features=128),
-            nn.ReLU(),
-            # A Gaussian is fully characterised by its mean \mu and variance \sigma**2
-            nn.Linear(in_features=128, out_features=2*latent_features), # <- note the 2*latent_features
-            
-        )
         
         # Generative Model
         # Decode the latent sample `z` into the parameters of the observation model
         # `p_\theta(x | z) = \prod_i B(x_i | g_\theta(x))`
-        self.decoder = nn.Sequential(
-            nn.Linear(in_features=latent_features, out_features=128),
-            nn.ReLU(),
-            nn.Linear(in_features=128, out_features=256),
-            nn.ReLU(),
-            nn.Linear(in_features=256, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=2*self.observation_features)
-        ) """
         self.encoder = nn.Sequential(
-          # Layer 0 [hw_in=68, hw_out=64>32]: INPUT LAYER
-            # W2=(W1−K+2P)/S]+1=[(68 - 5 + 2*0)/1]+1 = 64
-            nn.Conv2d(in_channels=self.input_shape[0], 
-                      out_channels=nbUnits, 
-                      kernel_size=5, 
-                      stride=1), 
-            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(64 - 2)/2] + 1 = 32
-            nn.LeakyReLU(),
+            # W2=(W1−K+2P)/S]+1=[(68 - 6 + 2*0)/2]+1 = 32
+            nn.Conv2d(in_channels=nc, 
+                      out_channels=ngf, 
+                      kernel_size=6, 
+                      stride=2, 
+                      padding=0, 
+                      bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
             PrintSize(),
-            
-            # Layer 1 [hw_in=32, hw_out=28>14]
-            # W2=(W1−K+2P)/S]+1=[(32 - 5 + 2*0)/1]+1 = 28
-            nn.Conv2d(in_channels=nbUnits, 
-                      out_channels=nbUnits, 
-                      kernel_size=(5,5), 
-                      stride=(1,1)), 
-            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(28 - 2)/2] + 1 = 14
-            nn.LeakyReLU(),
+            # W2=(W1−K+2P)/S]+1=[(32 - 4 + 2*1)/2]+1 = 16
+            nn.Conv2d(in_channels=ngf, 
+                      out_channels=ngf * 2, 
+                      kernel_size=4, 
+                      stride=2, 
+                      padding=1, 
+                      bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
             PrintSize(),
-            
-            # Layer 2 [hw_in=14, hw_out=10>5]
-            # W2=(W1−K+2P)/S]+1=[(14 - 5 + 2*0)/1]+1 = 10
-            nn.Conv2d(in_channels=nbUnits, 
-                      out_channels=nbUnits, 
-                      kernel_size=(5,5), 
-                      stride=(1,1)), 
-            nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2)), # W2=(W1−F)/S+1]=[(10 - 2)/2] + 1 = 5
-            nn.LeakyReLU(),
+            # W2=(W1−K+2P)/S]+1=[(16 - 4 + 2*1)/2]+1 = 8
+            nn.Conv2d(in_channels=ngf * 2, 
+                      out_channels=ngf * 4, 
+                      kernel_size=4, 
+                      stride=2, 
+                      padding=1, 
+                      bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
             PrintSize(),
-            
-            # Layer 3 [hw_in=5, hw_out=1]: EMBEDDING
-            # W2=(W1−K+2P)/S]+1=[(5 - 5 + 2*0)/1]+1 = 1
-            nn.Conv2d(in_channels=nbUnits, 
-                      out_channels=nbUnits, 
-                      kernel_size=(5,5), 
-                      stride=(1,1)), 
+            # W2=(W1−K+2P)/S]+1=[(8 - 4 + 2*1)/2]+1 = 4
+            nn.Conv2d(in_channels=ngf * 4, 
+                      out_channels=ngf * 8, 
+                      kernel_size=4, 
+                      stride=2, 
+                      padding=1, 
+                      bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            PrintSize(),
+            # W2=(W1−K+2P)/S]+1=[(4 - 4 + 2*0)/2]+1 = 1
+            nn.Conv2d(in_channels=ngf * 8, 
+                      out_channels=latent_features*2,
+                      kernel_size=4, 
+                      stride=1, 
+                      padding=0, 
+                      bias=False),
             PrintSize(),
             Flatten(),
-            nn.Linear(in_features=nbUnits, out_features=2*latent_features),
-            PrintSize(),
+            nn.Linear(in_features=latent_features*2, 
+                      out_features=2*latent_features),
+            PrintSize()
+                    
         )
         
         
@@ -368,55 +401,61 @@ class VariationalAutoencoder(nn.Module):
         # Decode the latent sample `z` into the parameters of the observation model
         # `p_\theta(x | z) = \prod_i B(x_i | g_\theta(x))`
         self.decoder = nn.Sequential(
-
-            # Layer 3+1 [hw_in=1, hw_out=5<10]
-            # (H−1)×S−2×P+D×(K−1)+OP+1 = (1-1)*1-2*0+1*(4-1)+0+1 = 4
+            
             UnFlatten(),
+            # input is Z, going into a convolution
             nn.ConvTranspose2d(in_channels=latent_features, 
-                               out_channels=nbUnits, 
+                               out_channels=ngf * 8, 
                                kernel_size=4, 
-                               stride=1,
-                               padding=0),
-            #nn.UpsamplingNearest2d(size=(10,10)),
-            nn.LeakyReLU(),
+                               stride=1, 
+                               padding=0, 
+                               bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
             PrintSize(),
-            
-            # Layer 3+2 [hw_in=10<10+8, hw_out=14<28]
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (1-1)*1-2*0+1*(4-1)+0+1 = 4
+            # state size. (ngf*8) x 4 x 4
+            nn.ConvTranspose2d(in_channels=ngf * 8, 
+                               out_channels=ngf * 4, 
+                               kernel_size=4, 
+                               stride=2, 
+                               padding=1, 
+                               bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            PrintSize(),
             # (H−1)×S−2×P+D×(K−1)+OP+1 = (4-1)*2-2*1+1*(4-1)+0+1 = 8
-            nn.ConvTranspose2d(in_channels=nbUnits, 
-                               out_channels=nbUnits, 
+            # state size. (ngf*4) x 8 x 8
+            nn.ConvTranspose2d(in_channels=ngf * 4, 
+                               out_channels=ngf * 2, 
                                kernel_size=4, 
-                               stride=2,
-                               padding=1),
-            #nn.UpsamplingNearest2d(size=(28,28)),
-            nn.LeakyReLU(),
+                               stride=2, 
+                               padding=1, 
+                               bias=False),
+            nn.BatchNorm2d(ngf * 2),
+            nn.ReLU(True),
             PrintSize(),
-            
-            # Layer 3+3 [hw_in=28<28+8, hw_out=32<64]
             # (H−1)×S−2×P+D×(K−1)+OP+1 = (8-1)*2-2*1+1*(4-1)+0+1 = 16
-            nn.ConvTranspose2d(in_channels=nbUnits, 
-                               out_channels=nbUnits, 
+            # state size. (ngf*2) x 16 x 16
+            nn.ConvTranspose2d(in_channels=ngf * 2, 
+                               out_channels=ngf, 
                                kernel_size=4, 
-                               stride=2,
-                               padding=1),
-            #nn.UpsamplingNearest2d(size=(64,64)),
-            nn.LeakyReLU(),
+                               stride=2, 
+                               padding=1, 
+                               bias=False),
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True),
             PrintSize(),
-
-             # (H−1)×S−2×P+D×(K−1)+OP+1 = (16-1)*2-2*1+1*(4-1)+0+1 = 32
-            nn.ConvTranspose2d(in_channels=nbUnits, 
-                               out_channels=nbUnits, 
-                               kernel_size=4, 
-                               stride=2,
-                               padding=1),
-            #nn.UpsamplingNearest2d(size=(64,64)),
-            nn.LeakyReLU(),
-            PrintSize(),
-            
-            # Layer 3+4 [hw_in=64, hw_out=68]: FINAL ACTIVATION
-            nn.ConvTranspose2d(in_channels=nbUnits, 
-                      out_channels=2*self.input_shape[0], 
-                      kernel_size=5, stride=1, padding=0),
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (16-1)*2-2*1+1*(4-1)+0+1 = 32
+            # state size. (ngf) x 32 x 32
+            nn.ConvTranspose2d(in_channels=ngf, 
+                               out_channels=nc * 2, 
+                               kernel_size=8, 
+                               stride=2, 
+                               padding=1, 
+                               bias=False),
+            # (H−1)×S−2×P+D×(K−1)+OP+1 = (32-1)*2-2*1+1*(8-1)+0+1 = 68
+            # state size. (nc) x 68 x 68
             PrintSize()
         )
         
@@ -461,7 +500,6 @@ class VariationalAutoencoder(nn.Module):
         # flatten the input
         #x = x.view(x.size(0), -1)
 
-        
         # define the posterior q(z|x) / encode x into q(z|x)
         qz = self.posterior(x)
         
@@ -492,7 +530,7 @@ class VariationalAutoencoder(nn.Module):
         return {'px': px, 'pz': pz, 'z': z}
 
 
-vae = VariationalAutoencoder(images[0].shape, latent_features)
+vae = VariationalAutoencoder(latent_features)
 mse_loss = nn.MSELoss(reduction='none')
 print(vae)
 
@@ -547,99 +585,98 @@ for key, tensor in diagnostics.items():
 
 # Discriminator class
 class Discriminator(nn.Module):
-    def __init__(self, input_shape:torch.Size, conv_channels:int, 
-                 kernel_size:int, stride:int):
+    def __init__(self):
         super(Discriminator, self).__init__()
-        
-        self.input_shape = input_shape
-        self.conv_channels = conv_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.observation_features = np.prod(input_shape)
-
+    
         # Defining activation function
-        self.activation = nn.LeakyReLU()
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
         self.sigmoid = nn.Sigmoid()
 
         # Define batchnorms
-        self.batchnorm1_2d = nn.BatchNorm2d(self.conv_channels)
-        self.batchnorm2_2d = nn.BatchNorm2d(64)
-        self.batchnorm3_2d = nn.BatchNorm2d(1)
-
-        # Linear layers
-        self.linear_first = nn.Linear(in_features=self.observation_features, out_features=256)
-        self.linear_middle = nn.Linear(in_features=256, out_features=128)
-        self.linear_last = nn.Linear(in_features=1, out_features=1)
+        self.batchnorm1 = nn.BatchNorm2d(ndf * 2)
+        self.batchnorm2 = nn.BatchNorm2d(ndf * 4)
+        self.batchnorm3 = nn.BatchNorm2d(ndf * 8)
         
         # CNN Layers
-        self.conv_first = nn.Conv2d(in_channels=self.input_shape[1],
-                             out_channels=self.conv_channels,
-                             kernel_size=self.kernel_size,
-                             stride=self.stride)
+        self.conv_1 = nn.Conv2d(in_channels=nc,
+                                out_channels=ndf,
+                                kernel_size=6,
+                                stride=2,
+                                padding=0,
+                                bias=False)
         
-        self.conv_mid = nn.Conv2d(in_channels=self.conv_channels,
-                               out_channels=self.conv_channels,
-                               kernel_size=self.kernel_size,
-                               stride=self.stride)
+        self.conv_2 = nn.Conv2d(in_channels=ndf,
+                                out_channels=ndf * 2,
+                                kernel_size=4,
+                                stride=2,
+                                padding=1,
+                                bias=False)
+
+        self.conv_3 = nn.Conv2d(in_channels=ndf * 2,
+                                out_channels=ndf * 4,
+                                kernel_size=4,
+                                stride=2,
+                                padding=1,
+                                bias=False)
         
-        self.conv_last = nn.Conv2d(in_channels=conv_channels,
-                               out_channels=64,
-                               kernel_size=self.kernel_size,
-                               stride=self.stride)
+        self.conv_4 = nn.Conv2d(in_channels=ndf * 4,
+                                out_channels=ndf * 8,
+                                kernel_size=4,
+                                stride=2,
+                                padding=1,
+                                bias=False)
         
-        self.conv_out = nn.Conv2d(in_channels=64,
-                               out_channels=1,
-                               kernel_size=1,
-                               stride=self.stride)
+        self.conv_out = nn.Conv2d(in_channels=ndf * 8,
+                                  out_channels=1,
+                                  kernel_size=4,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
         
-        # Max-pooling layer
+        # Max-pooling layer  # W2=(W1−F)/S+1]
         self.max_pool = nn.MaxPool2d(kernel_size=(2,2), stride=(2, 2))
         
 
     def forward(self, x_img):
         
-        ## Convolutional layers ##
-        
-        # Layer 0 [hw_in=68, hw_out=64>32]: INPUT LAYER
-        x_img = self.conv_first(x_img) # W2=(W1−K+2P)/S]+1=[(68 - 5 + 2*0)/1]+1 = 64
-        x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(64 - 2)/2] + 1 = 32
+        ## Convolutional layers ##        
+        # Layer 1 [hw_in=68, hw_out=32]: INPUT LAYER
+        x_img = self.conv_1(x_img) # W2=(W1−K+2P)/S]+1=[(68 - 6 + 2*0)/2]+1 = 32
         x_img = self.activation(x_img)
-        #x_img = self.batchnorm1_2d(x_img)
         x_img_1 = x_img
         
-        # Layer 1 [hw_in=32, hw_out=28>14]
-        x_img = self.conv_mid(x_img) # W2=(W1−K+2P)/S]+1=[(32 - 5 + 2*0)/1]+1 = 28
-        x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(28 - 2)/2] + 1 = 14
+        # Layer 2 [hw_in=32, hw_out=16]
+        x_img = self.conv_2(x_img) # W2=(W1−K+2P)/S]+1=((32 - 4 + 2*1)/2)+1 = 16
+        x_img = self.batchnorm1(x_img)
         x_img = self.activation(x_img)
-        #x_img = self.batchnorm1_2d(x_img)
         x_img_2 = x_img
 
-        # Layer 2 [hw_in=14, hw_out=10>5]
-        x_img = self.conv_mid(x_img) # W2=(W1−K+2P)/S]+1=[(14 - 5 + 2*0)/1]+1 = 10
-        x_img = self.max_pool(x_img) # W2=(W1−F)/S+1]=[(10 - 2)/2] + 1 = 5
+        # Layer 3 [hw_in=16, hw_out=8]
+        x_img = self.conv_3(x_img) # W2=(W1−K+2P)/S]+1=((16 - 4 + 2*1)/2)+1 = 8
+        x_img = self.batchnorm2(x_img)
         x_img = self.activation(x_img)
-        #x_img = self.batchnorm1_2d(x_img)
         x_img_3 = x_img
 
-        # Layer 3 [hw_in=5, hw_out=1]: 
-        x_img = self.conv_last(x_img) # W2=(W1−K+2P)/S]+1=[(5 - 5 + 2*0)/1]+1 = 1
+        # Layer 4 [hw_in=8, hw_out=4]: 
+        x_img = self.conv_4(x_img) # W2=(W1−K+2P)/S]+1=((8 - 4 + 2*1)/2)+1 = 4
+        x_img = self.batchnorm3(x_img)
         x_img = self.activation(x_img)
+        x_img_4 = x_img
         
-        # Layer 4 [hw_in=1, hw_out=1]:
-        x_img = self.conv_out(x_img) # W2=(W1−K+2P)/S]+1=[(1 - 1 + 2*0)/1]+1 = 1
+        # Layer 5 [hw_in=4, hw_out=1]:
+        x_img = self.conv_out(x_img) # W2=(W1−K+2P)/S]+1=((4-4+ 2*0)/1)+1 = 1
 
         x_img = self.sigmoid(x_img)
 
-        intermediate_rep = [x_img_1, x_img_2, x_img_3]
+        intermediate_rep = [x_img_1, x_img_2, x_img_3, x_img_4]
         output = x_img
         
         return output, intermediate_rep
 
-discrim_test = Discriminator(images.reshape((102, 3, 68, 68)).shape, 
-                             conv_channels=32, kernel_size=5, stride=1)
+discrim_test = Discriminator()
 print(discrim_test)
 
-output, intermediate_rep = discrim_test(images.reshape((102, 3, 68, 68)))
+output, intermediate_rep = discrim_test(images)
 print(f"{'output':6} | shape: {list(output.shape)}")
 for i, tensor in enumerate(intermediate_rep):
     print(f"x_img_{i+1} | shape: {list(tensor.shape)}")
@@ -662,26 +699,23 @@ def initialize_weights(m):
 # Define the models, evaluator and optimizer
 
 # VAE
-latent_features = 256
-vae = VariationalAutoencoder(images[0].shape, latent_features)
+vae = VariationalAutoencoder(latent_features)
 
 # Evaluator: Variational Inference
-beta = 2.0
-vi = VariationalInference(beta=beta)
+vi = VariationalInference(beta=beta2)
 
 # Discriminator
-stride = 1
-kernel_size = 5
-conv_channels = 32
-input_size = (batch_size//2, 3, 68, 68)
-discrim = Discriminator(input_size, 
-                        conv_channels=conv_channels, 
-                        kernel_size=kernel_size, stride=stride)
+discrim = Discriminator()
 #discrim.apply(initialize_weights)
 
 # The Adam optimizer works really well with VAEs.
-vae_optimizer = torch.optim.Adam(vae.parameters(), lr=1e-2)
-discriminator_optim = torch.optim.SGD(discrim.parameters(), lr=1e-5)
+#vae_optimizer = torch.optim.Adam(vae.parameters(), lr=1e-2)
+#discriminator_optim = torch.optim.SGD(discrim.parameters(), lr=1e-5)
+
+# Setup Adam optimizers for both G and D
+#discriminator_optim = torch.optim.Adam(discrim.parameters(), lr=lr_D, betas=(beta1, 0.999))
+discriminator_optim = torch.optim.SGD(discrim.parameters(), lr=lr_D)
+vae_optimizer = torch.optim.Adam(vae.parameters(), lr=lr_VAE, betas=(beta1, 0.999))
 
 # define dictionary to store the training curves
 training_data = defaultdict(list)
@@ -696,31 +730,29 @@ def schedule_weight(delay):
     return w
 
 epoch = 0
-num_epochs = 15
-nll_val = []
 best_nll = 1000000.
 patience = 0
-max_patience = 40
-slope  = 2500.0
-discriminator_layers = 5
+nll_val = []
 loss_repr_func = nn.MSELoss()
 bce_loss = nn.BCELoss()
+
+# Lists to keep track of progress
+img_list = []
+D_losses = []
+VAE_losses = []
 representation_loss = []
 discriminator_real_loss = []
 discriminator_fake_loss = []
 discriminator_avg_loss = []
 discriminator_sum_loss = []
-total_loss = []
+total_loss_list = []
 real_label = 1.0
 fake_label = 0.0
 
 name = 'vae_plus'
-result_dir = 'results_plus_slope_2500_lower_D_lr_without_batchnorm/'
+result_dir = 'results_plus_updated/'
 if not(os.path.exists(result_dir)):
     os.mkdir(result_dir)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f">> Using device: {device}")
 
 # move the model to the device
 vae = vae.to(device)
@@ -744,13 +776,13 @@ while epoch < num_epochs:
 
     # Go through each batch in the training dataset using the loader
     # Note that y is not necessarily known as it is here
-    for x, y in training_loader:
-
+    for i, (x, y) in enumerate(training_loader, 0):
+            
+            step += 1
 
             ############################
             # (Step 0) Prepare data:
             ###########################
-            step += 1
             tmp_batch_size = x.size(0)
             b1, b2 = torch.split(x, split_size_or_sections=tmp_batch_size//2)
             batch_size_half = b1.size(0)
@@ -831,7 +863,7 @@ while epoch < num_epochs:
             loss_repr = 0
             loss_repr_list = []
 
-            delays = [slope * (k+1) for k in range(discriminator_layers)]
+            delays = [slope * (k+1) for k in range(len(inter_repr_fake))]
 
             for i, (repr_fake, repr_real) in enumerate(zip(inter_repr_fake, inter_repr_real_b1)):
                 loss_batch = loss_repr_func(repr_fake, repr_real)
@@ -841,7 +873,6 @@ while epoch < num_epochs:
                 loss_repr += loss_weight * loss_batch #-- Schedule-based weighted average
             
             loss_total = loss_elbo + loss_repr
-            print(f"Training loss: {loss_total}")
             
             # Backpropagate the gradients for the VAE
             loss_total.backward()
@@ -857,6 +888,27 @@ while epoch < num_epochs:
             batch_discrim_sum_loss.append(errD.item())   
             batch_repr_loss.append(loss_repr.item())
             batch_total_loss.append(loss_total.item()) 
+
+            # Output training stats
+            if step % 50 == 0:
+                print('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_VAE: %.4f'
+                  % (epoch, num_epochs, i, len(training_loader),
+                     errD.item(), loss_total.item()))
+                print(f"Training loss: {loss_total}")
+
+            
+            # Save Losses for plotting later
+            D_losses.append(errD.item())
+            VAE_losses.append(loss_total.item())
+            
+            # Check how the generator is doing by saving G's output on fixed_noise
+            if (step % 500 == 0) or ((epoch == num_epochs-1) and (i == len(training_loader)-1)):
+                with torch.no_grad():
+                    loss_elbo, xhat, diagnostics, outputs = vi(vae, b1)
+                    xhat = xhat.detach().cpu()
+                img_list.append(vutils.make_grid(xhat, padding=2, normalize=True))
+
+
     
     # gather data for the full epoch
     for k, v in training_epoch_data.items():
@@ -867,7 +919,7 @@ while epoch < num_epochs:
     discriminator_avg_loss.append(np.mean(batch_discrim_avg_loss))
     discriminator_sum_loss.append(np.mean(batch_discrim_sum_loss))
     representation_loss.append(np.mean(batch_repr_loss))
-    total_loss.append(np.mean(batch_total_loss))
+    total_loss_list.append(np.mean(batch_total_loss))
         
     # Evaluate on a single batch, do not propagate gradients
     with torch.no_grad():
@@ -919,11 +971,29 @@ f.close()
 
 samples_real(result_dir + name, test_loader)
 
+plt.figure(figsize=(10,5))
+plt.title("VAE and Discriminator Loss During Training")
+plt.plot(VAE_losses,label="G")
+plt.plot(D_losses,label="D")
+plt.xlabel("iterations")
+plt.ylabel("Loss")
+plt.legend()
+plt.savefig(result_dir + 'VAE_and_discriminator_training_loss.png', bbox_inches='tight')
+
+fig = plt.figure(figsize=(8,8))
+plt.axis("off")
+ims = [[plt.imshow(np.transpose(i,(1,2,0)), animated=True)] for i in img_list]
+ani = animation.ArtistAnimation(fig, ims, interval=1000, repeat_delay=1000, blit=True)
+# saving to m4 using ffmpeg writer
+writervideo = animation.FFMpegWriter(fps=60)
+ani.save(result_dir + 'VAE_progression.mp4', writer=writervideo)
+plt.close()
+
 plot_curve(result_dir + name + "_nll_val_curve", nll_val)
 plot_curve(result_dir + name + "_discriminator_real_loss", discriminator_real_loss, y_label="discriminator_real_loss")
 plot_curve(result_dir + name + "_discriminator_fake_loss", discriminator_fake_loss, y_label="discriminator_fake_loss")
 plot_curve(result_dir + name + "_discriminator_avg_loss", discriminator_avg_loss, y_label="discriminator_avg_loss")
 plot_curve(result_dir + name + "_discriminator_sum_loss", discriminator_sum_loss, y_label="discriminator_sum_loss")
 plot_curve(result_dir + name + "_representation_loss", representation_loss, y_label="representation_loss")
-plot_curve(result_dir + name + "_total_loss", total_loss, y_label="total_loss")
+plot_curve(result_dir + name + "_total_loss", total_loss_list, y_label="total_loss")
 
